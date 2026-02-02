@@ -26,6 +26,8 @@ type Config struct {
 		AutoDebate       bool `yaml:"auto_debate"`
 		ConsensusTimeout int  `yaml:"consensus_timeout"`
 		ModelTimeout     int  `yaml:"model_timeout"`
+		RetryAttempts    int  `yaml:"retry_attempts"`
+		RetryDelay       int  `yaml:"retry_delay"` // milliseconds
 	} `yaml:"defaults"`
 }
 
@@ -69,6 +71,8 @@ func defaultConfig() *Config {
 	cfg.Defaults.AutoDebate = true
 	cfg.Defaults.ConsensusTimeout = 30
 	cfg.Defaults.ModelTimeout = 60
+	cfg.Defaults.RetryAttempts = 3
+	cfg.Defaults.RetryDelay = 1000 // 1 second
 	return cfg
 }
 
@@ -84,6 +88,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Defaults.ModelTimeout == 0 {
 		cfg.Defaults.ModelTimeout = 60
+	}
+	if cfg.Defaults.RetryAttempts == 0 {
+		cfg.Defaults.RetryAttempts = 3
+	}
+	if cfg.Defaults.RetryDelay == 0 {
+		cfg.Defaults.RetryDelay = 1000
 	}
 }
 

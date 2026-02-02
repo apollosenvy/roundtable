@@ -34,10 +34,11 @@ func Program() *tea.Program {
 
 // Message types for async model responses
 type modelResponseMsg struct {
-	modelID string
-	content string
-	done    bool
-	err     error
+	modelID   string
+	content   string
+	done      bool
+	err       error
+	isTimeout bool // True if error was due to timeout
 }
 
 type allModelsDoneMsg struct{}
@@ -83,6 +84,10 @@ type Model struct {
 	// Streaming state - tracks partial messages being built
 	// map[modelID]messageIndex - which message in debate.Messages is being streamed to
 	streamingMsgs map[string]int
+
+	// View mode state (normal, history browser, etc.)
+	viewMode     ViewMode
+	historyState *HistoryState
 }
 
 func New() Model {
@@ -98,12 +103,20 @@ func New() Model {
 	// Create model registry
 	registry := models.NewRegistry(cfg)
 
-	// Create orchestrator with timeout from config
+	// Create orchestrator with timeout and retry settings from config
 	timeout := time.Duration(cfg.Defaults.ModelTimeout) * time.Second
 	if timeout == 0 {
 		timeout = 60 * time.Second
 	}
-	orch := orchestrator.New(registry, timeout)
+	retryAttempts := cfg.Defaults.RetryAttempts
+	if retryAttempts == 0 {
+		retryAttempts = 3
+	}
+	retryDelay := time.Duration(cfg.Defaults.RetryDelay) * time.Millisecond
+	if retryDelay == 0 {
+		retryDelay = time.Second
+	}
+	orch := orchestrator.NewWithRetry(registry, timeout, retryAttempts, retryDelay)
 
 	// Text input
 	ta := textarea.New()
@@ -142,6 +155,8 @@ func New() Model {
 		activeTab:     0,
 		focus:         FocusInput,
 		streamingMsgs: make(map[string]int),
+		viewMode:      ViewNormal,
+		historyState:  NewHistoryState(),
 	}
 }
 
@@ -216,20 +231,47 @@ func (m *Model) activeDebate() *Debate {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
+	// Handle history view mode separately
+	if m.viewMode == ViewHistory {
+		return m.updateHistoryView(msg)
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "ctrl+q":
+			// Cancel any ongoing model requests before quitting
+			if m.cancelDebate != nil {
+				m.cancelDebate()
+			}
 			return m, tea.Quit
+
+		case "alt+h":
+			// Open history browser
+			m.viewMode = ViewHistory
+			if m.historyState == nil {
+				m.historyState = NewHistoryState()
+			}
+			m.historyState.SetMaxHeight(m.height)
+			m.historyState.LoadDebates(m.store)
+			return m, nil
 
 		case "ctrl+enter":
 			// Send message
 			prompt := strings.TrimSpace(m.input.Value())
 			if prompt != "" && m.activeDebate() != nil {
-				m.activeDebate().AddMessage("user", prompt)
+				debate := m.activeDebate()
+				debate.AddMessage("user", prompt)
+
+				// Persist user message to database
+				m.saveMessage(debate.ID, "user", prompt, "user")
+
 				m.input.Reset()
+				// Clear streaming state for new round
+				m.streamingMsgs = make(map[string]int)
 				m.updateChatView()
-				// TODO: Dispatch to models
+				// Dispatch to all models in parallel
+				return m, m.dispatchToModels(prompt)
 			}
 			return m, nil
 
@@ -296,6 +338,63 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.updateLayout()
 		m.ready = true
+
+	case modelResponseMsg:
+		debate := m.activeDebate()
+		if debate == nil {
+			return m, nil
+		}
+
+		if msg.err != nil {
+			// Add error message with proper error styling
+			errContent := msg.err.Error()
+
+			// Set model status based on error type
+			if msg.isTimeout {
+				debate.UpdateModelStatus(msg.modelID, models.StatusTimeout)
+				debate.AddErrorMessage(msg.modelID, errContent, true)
+			} else {
+				debate.UpdateModelStatus(msg.modelID, models.StatusError)
+				debate.AddErrorMessage(msg.modelID, errContent, false)
+			}
+
+			// Persist error to database
+			m.saveMessage(debate.ID, msg.modelID, "[ERROR] "+errContent, "system")
+		} else if msg.content != "" {
+			// Check if we're streaming to an existing message or starting a new one
+			if idx, ok := m.streamingMsgs[msg.modelID]; ok && idx < len(debate.Messages) {
+				// Append to existing streaming message
+				debate.Messages[idx].Content += msg.content
+			} else {
+				// Start a new message
+				debate.AddMessage(msg.modelID, msg.content)
+				m.streamingMsgs[msg.modelID] = len(debate.Messages) - 1
+			}
+			debate.ModelStatus[msg.modelID] = models.StatusResponding
+		}
+
+		if msg.done {
+			// Finalize the message - save complete content to database
+			if idx, ok := m.streamingMsgs[msg.modelID]; ok && idx < len(debate.Messages) {
+				finalContent := debate.Messages[idx].Content
+				m.saveMessage(debate.ID, msg.modelID, finalContent, "model")
+				delete(m.streamingMsgs, msg.modelID)
+			}
+			debate.ModelStatus[msg.modelID] = models.StatusIdle
+		}
+
+		m.updateChatView()
+		return m, nil
+
+	case allModelsDoneMsg:
+		debate := m.activeDebate()
+		if debate != nil {
+			systemMsg := "All models have responded. Any objections or additions?"
+			debate.AddMessage("system", systemMsg)
+			m.saveMessage(debate.ID, "system", systemMsg, "system")
+			m.updateChatView()
+		}
+		return m, nil
 	}
 
 	// Update focused component
@@ -332,15 +431,28 @@ func (m *Model) cycleFocus(dir int) {
 
 func (m *Model) createTab() {
 	debateID := uuid.New().String()[:8]
-	debate := NewDebate(debateID, fmt.Sprintf("Debate %d", len(m.debates)+1))
+	debateName := fmt.Sprintf("Debate %d", len(m.debates)+1)
+	debate := NewDebate(debateID, debateName)
 	m.debates = append(m.debates, debate)
 	m.activeTab = len(m.debates) - 1
+
+	// Persist new debate to database
+	if m.store != nil {
+		m.store.CreateDebate(debateID, debateName, "")
+	}
+
 	m.updateChatView()
 }
 
 func (m *Model) closeTab(idx int) {
 	if idx < 0 || idx >= len(m.debates) || len(m.debates) <= 1 {
 		return
+	}
+
+	// Mark debate as abandoned in database before removing from memory
+	closedDebate := m.debates[idx]
+	if m.store != nil && closedDebate != nil {
+		m.store.UpdateDebateStatus(closedDebate.ID, "abandoned", "")
 	}
 
 	m.debates = append(m.debates[:idx], m.debates[idx+1:]...)
@@ -394,6 +506,10 @@ func (m Model) View() string {
 
 	if m.showHelp {
 		return m.renderHelp()
+	}
+
+	if m.viewMode == ViewHistory && m.historyState != nil {
+		return m.historyState.Render(m.width, m.height)
 	}
 
 	// Title bar
@@ -581,3 +697,118 @@ func (m Model) renderInputPane() string {
 }
 
 // renderHelp is defined in help.go
+
+// updateHistoryView handles input when in history view mode
+func (m Model) updateHistoryView(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "ctrl+q":
+			return m, tea.Quit
+
+		case "esc", "q":
+			// Close history view
+			m.viewMode = ViewNormal
+			return m, nil
+
+		case "up", "k":
+			if m.historyState != nil {
+				m.historyState.Up()
+			}
+			return m, nil
+
+		case "down", "j":
+			if m.historyState != nil {
+				m.historyState.Down()
+			}
+			return m, nil
+
+		case "enter":
+			// Resume the selected debate
+			if m.historyState != nil {
+				selected := m.historyState.Selected()
+				if selected != nil {
+					debate, err := ResumeDebate(m.store, selected.ID)
+					if err == nil && debate != nil {
+						// Check if this debate is already open
+						for i, d := range m.debates {
+							if d.ID == debate.ID {
+								// Switch to existing tab
+								m.activeTab = i
+								m.viewMode = ViewNormal
+								m.updateChatView()
+								return m, nil
+							}
+						}
+
+						// Add as new tab
+						m.debates = append(m.debates, debate)
+						m.activeTab = len(m.debates) - 1
+						m.updateChatView()
+					}
+				}
+			}
+			m.viewMode = ViewNormal
+			return m, nil
+		}
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		if m.historyState != nil {
+			m.historyState.SetMaxHeight(m.height)
+		}
+	}
+
+	return m, nil
+}
+
+// dispatchToModels sends the prompt to all enabled models in parallel
+// It creates a goroutine that reads from the orchestrator's response channel
+// and forwards messages to the tea.Program via Send()
+func (m *Model) dispatchToModels(prompt string) tea.Cmd {
+	return func() tea.Msg {
+		debate := m.activeDebate()
+		if debate == nil || m.orchestrator == nil {
+			return nil
+		}
+
+		// Create cancellable context
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelDebate = cancel
+
+		// Convert debate messages to model messages format
+		var history []models.Message
+		for _, msg := range debate.Messages {
+			history = append(history, models.Message{
+				Source:    msg.Source,
+				Content:   msg.Content,
+				Timestamp: msg.Timestamp,
+			})
+		}
+
+		// Start parallel model requests
+		responses := m.orchestrator.ParallelSeed(ctx, history, prompt)
+
+		// Forward responses to the UI as tea messages
+		go func() {
+			for resp := range responses {
+				if program != nil {
+					program.Send(modelResponseMsg{
+						modelID:   resp.ModelID,
+						content:   resp.Content,
+						done:      resp.Done,
+						err:       resp.Error,
+						isTimeout: resp.IsTimeout,
+					})
+				}
+			}
+			// Signal that all models are done
+			if program != nil {
+				program.Send(allModelsDoneMsg{})
+			}
+		}()
+
+		return nil
+	}
+}

@@ -2,12 +2,11 @@
 package models
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 )
@@ -16,7 +15,7 @@ type GPTModel struct {
 	BaseModel
 	apiKey      string
 	modelName   string
-	client      *http.Client
+	client      *RetryableClient
 	cancel      context.CancelFunc
 	mu          sync.Mutex
 }
@@ -32,7 +31,23 @@ func NewGPT(apiKey, modelName string) *GPTModel {
 		}),
 		apiKey:    apiKey,
 		modelName: modelName,
-		client:    &http.Client{},
+		client:    NewRetryableClient(DefaultRetryConfig()),
+	}
+}
+
+// NewGPTWithRetry creates a GPT model with custom retry settings
+func NewGPTWithRetry(apiKey, modelName string, retryConfig RetryConfig) *GPTModel {
+	return &GPTModel{
+		BaseModel: NewBaseModel(ModelInfo{
+			ID:      "gpt",
+			Name:    "GPT",
+			Color:   "#00FF00",
+			CanExec: false,
+			CanRead: true,
+		}),
+		apiKey:    apiKey,
+		modelName: modelName,
+		client:    NewRetryableClient(retryConfig),
 	}
 }
 
@@ -93,7 +108,7 @@ func (m *GPTModel) Send(ctx context.Context, history []Message, prompt string) <
 			return
 		}
 
-		req, err := http.NewRequestWithContext(cmdCtx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(bodyBytes))
+		req, err := NewRequestWithBody(cmdCtx, "POST", "https://api.openai.com/v1/chat/completions", bodyBytes)
 		if err != nil {
 			ch <- Chunk{Error: fmt.Errorf("request: %w", err)}
 			return
@@ -102,15 +117,29 @@ func (m *GPTModel) Send(ctx context.Context, history []Message, prompt string) <
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+m.apiKey)
 
-		resp, err := m.client.Do(req)
+		resp, err := m.client.DoWithRetry(cmdCtx, req)
 		if err != nil {
-			ch <- Chunk{Error: fmt.Errorf("do: %w", err)}
+			// Check for timeout
+			if errors.Is(err, context.DeadlineExceeded) {
+				m.SetStatus(StatusTimeout)
+				ch <- Chunk{Error: fmt.Errorf("request timed out"), IsTimeout: true}
+				return
+			}
+			// Check for rate limit
+			if errors.Is(err, ErrRateLimit) {
+				m.SetStatus(StatusError)
+				ch <- Chunk{Error: fmt.Errorf("rate limit exceeded - try again later")}
+				return
+			}
+			m.SetStatus(StatusError)
+			ch <- Chunk{Error: fmt.Errorf("connection failed: %w", err)}
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
 			body, _ := io.ReadAll(resp.Body)
+			m.SetStatus(StatusError)
 			ch <- Chunk{Error: fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))}
 			return
 		}

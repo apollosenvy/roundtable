@@ -13,9 +13,11 @@ import (
 
 // DebateMessage represents a message in the debate
 type DebateMessage struct {
-	Source    string    // claude, gpt, gemini, grok, user, system
+	Source    string    // claude, gpt, gemini, grok, user, system, error
 	Content   string
 	Timestamp time.Time
+	IsError   bool      // If true, render in error style
+	IsTimeout bool      // If true, this is specifically a timeout error
 }
 
 // Debate represents a single debate session
@@ -93,23 +95,51 @@ func (d *Debate) AddMessage(source, content string) {
 	})
 }
 
+// AddErrorMessage adds an error message that will be rendered in red
+func (d *Debate) AddErrorMessage(source, content string, isTimeout bool) {
+	d.Messages = append(d.Messages, DebateMessage{
+		Source:    source,
+		Content:   content,
+		Timestamp: time.Now(),
+		IsError:   true,
+		IsTimeout: isTimeout,
+	})
+}
+
 func (d *Debate) RenderMessages(width int) string {
 	var sb strings.Builder
 
 	for _, msg := range d.Messages {
 		ts := msg.Timestamp.Format("15:04")
-		style := ModelStyle(msg.Source)
 
-		// Model name header
-		header := style.Render(fmt.Sprintf("[%s] %s:", ts, formatSource(msg.Source)))
+		// Use error style for error messages, otherwise model style
+		var style lipgloss.Style
+		var header string
+
+		if msg.IsError {
+			style = ErrorStyle
+			errorType := "Error"
+			if msg.IsTimeout {
+				errorType = "Timeout"
+			}
+			header = style.Render(fmt.Sprintf("[%s] %s %s:", ts, formatSource(msg.Source), errorType))
+		} else {
+			style = ModelStyle(msg.Source)
+			header = style.Render(fmt.Sprintf("[%s] %s:", ts, formatSource(msg.Source)))
+		}
+
 		sb.WriteString(header)
 		sb.WriteString("\n")
 
-		// Message content with indent
+		// Message content with indent - errors in red
 		lines := strings.Split(msg.Content, "\n")
 		for _, line := range lines {
 			sb.WriteString("  ")
-			sb.WriteString(line)
+			if msg.IsError {
+				sb.WriteString(ErrorStyle.Render(line))
+			} else {
+				sb.WriteString(line)
+			}
 			sb.WriteString("\n")
 		}
 		sb.WriteString("\n")

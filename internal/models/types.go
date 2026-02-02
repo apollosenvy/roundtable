@@ -5,9 +5,10 @@ import "time"
 
 // Chunk represents a piece of streaming response
 type Chunk struct {
-	Text  string
-	Done  bool
-	Error error
+	Text      string
+	Done      bool
+	Error     error
+	IsTimeout bool // Distinguishes timeout from other errors
 }
 
 // Message represents a message in the debate

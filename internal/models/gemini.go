@@ -158,7 +158,7 @@ func (m *GeminiModel) parseLine(line string, fullText *strings.Builder) *Chunk {
 		if msg, ok := event["message"].(string); ok {
 			errMsg = msg
 		}
-		return &Chunk{Error: fmt.Errorf(errMsg)}
+		return &Chunk{Error: fmt.Errorf("%s", errMsg)}
 	}
 
 	return nil

@@ -68,6 +68,7 @@ func HelpContent(width, height int) string {
 		{"Alt+]", "Next tab"},
 		{"Alt+N", "Create new debate tab"},
 		{"Alt+W", "Close current tab"},
+		{"Alt+H", "Browse past debates (history)"},
 		{"Ctrl+Enter", "Send message to all models"},
 		{"F1 / ?", "Toggle this help overlay"},
 		{"Tab", "Cycle focus forward (Input -> Chat -> Context -> Models)"},
