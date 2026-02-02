@@ -111,6 +111,12 @@ func (d *Debate) AddErrorMessage(source, content string, isTimeout bool) {
 func (d *Debate) RenderMessages(width int) string {
 	var sb strings.Builder
 
+	// Account for indent (2 spaces) and some padding
+	contentWidth := width - 4
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
 	for _, msg := range d.Messages {
 		ts := msg.Timestamp.Format("15:04")
 
@@ -133,21 +139,51 @@ func (d *Debate) RenderMessages(width int) string {
 		sb.WriteString(header)
 		sb.WriteString("\n")
 
-		// Message content with indent - errors in red
+		// Message content with indent and word wrapping
 		lines := strings.Split(msg.Content, "\n")
 		for _, line := range lines {
-			sb.WriteString("  ")
-			if msg.IsError {
-				sb.WriteString(ErrorStyle.Render(line))
-			} else {
-				sb.WriteString(line)
+			// Word wrap each line
+			wrapped := wordWrap(line, contentWidth)
+			for _, wline := range wrapped {
+				sb.WriteString("  ")
+				if msg.IsError {
+					sb.WriteString(ErrorStyle.Render(wline))
+				} else {
+					sb.WriteString(wline)
+				}
+				sb.WriteString("\n")
 			}
-			sb.WriteString("\n")
 		}
 		sb.WriteString("\n")
 	}
 
 	return sb.String()
+}
+
+// wordWrap wraps text to fit within the specified width
+func wordWrap(text string, width int) []string {
+	if width <= 0 || len(text) <= width {
+		return []string{text}
+	}
+
+	var lines []string
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{""}
+	}
+
+	currentLine := words[0]
+	for _, word := range words[1:] {
+		if len(currentLine)+1+len(word) <= width {
+			currentLine += " " + word
+		} else {
+			lines = append(lines, currentLine)
+			currentLine = word
+		}
+	}
+	lines = append(lines, currentLine)
+
+	return lines
 }
 
 func formatSource(source string) string {

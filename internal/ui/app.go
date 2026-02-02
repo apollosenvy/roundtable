@@ -294,8 +294,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyState.LoadDebates(m.store)
 			return m, nil
 
-		case "ctrl+enter":
+		case "ctrl+enter", "ctrl+s", "alt+enter":
 			// Send message or execute command
+			// Note: ctrl+enter may not work in all terminals, ctrl+s and alt+enter are alternatives
 			input := strings.TrimSpace(m.input.Value())
 			if input == "" {
 				return m, nil
@@ -344,6 +345,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "shift+tab":
 			m.cycleFocus(-1)
 			return m, nil
+
+		// Scroll chat when focused (or always with j/k)
+		case "up", "k":
+			if m.focus == FocusChat {
+				m.chatView.LineUp(1)
+				return m, nil
+			}
+		case "down", "j":
+			if m.focus == FocusChat {
+				m.chatView.LineDown(1)
+				return m, nil
+			}
+		case "pgup", "ctrl+u":
+			if m.focus == FocusChat {
+				m.chatView.HalfViewUp()
+				return m, nil
+			}
+		case "pgdown", "ctrl+d":
+			if m.focus == FocusChat {
+				m.chatView.HalfViewDown()
+				return m, nil
+			}
+		case "home", "g":
+			if m.focus == FocusChat {
+				m.chatView.GotoTop()
+				return m, nil
+			}
+		case "end", "G":
+			if m.focus == FocusChat {
+				m.chatView.GotoBottom()
+				return m, nil
+			}
 
 		// Tab switching
 		case "alt+1":

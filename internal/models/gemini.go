@@ -128,17 +128,13 @@ func (m *GeminiModel) parseLine(line string, fullText *strings.Builder) *Chunk {
 	eventType, _ := event["type"].(string)
 
 	switch eventType {
-	case "assistant", "message":
-		msgData, _ := event["message"].(map[string]any)
-		content, _ := msgData["content"].([]any)
-
-		for _, block := range content {
-			b, _ := block.(map[string]any)
-			if blockType, _ := b["type"].(string); blockType == "text" {
-				if text, ok := b["text"].(string); ok {
-					fullText.WriteString(text)
-					return &Chunk{Text: text}
-				}
+	case "message":
+		// Gemini CLI format: {"type":"message","role":"assistant","content":"text","delta":true}
+		role, _ := event["role"].(string)
+		if role == "assistant" {
+			if content, ok := event["content"].(string); ok && content != "" {
+				fullText.WriteString(content)
+				return &Chunk{Text: content}
 			}
 		}
 
@@ -150,7 +146,14 @@ func (m *GeminiModel) parseLine(line string, fullText *strings.Builder) *Chunk {
 			}
 		}
 
-	case "result", "done":
+	case "result":
+		// Check for success/error status
+		if status, ok := event["status"].(string); ok && status == "success" {
+			return &Chunk{Done: true}
+		}
+		return &Chunk{Done: true}
+
+	case "done":
 		return &Chunk{Done: true}
 
 	case "error":
@@ -159,6 +162,10 @@ func (m *GeminiModel) parseLine(line string, fullText *strings.Builder) *Chunk {
 			errMsg = msg
 		}
 		return &Chunk{Error: fmt.Errorf("%s", errMsg)}
+
+	case "init":
+		// Initialization message, ignore
+		return nil
 	}
 
 	return nil
