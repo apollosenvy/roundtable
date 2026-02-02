@@ -20,6 +20,7 @@ import (
 	ctxloader "roundtable/internal/context"
 	"roundtable/internal/db"
 	"roundtable/internal/export"
+	"roundtable/internal/guardian"
 	"roundtable/internal/hermes"
 	"roundtable/internal/memory"
 	"roundtable/internal/models"
@@ -105,6 +106,9 @@ type Model struct {
 
 	// Session memory client for learning tracking
 	memory *memory.Client
+
+	// Guardian for destructive operation protection
+	guardian *guardian.Guardian
 }
 
 func New() Model {
@@ -143,6 +147,9 @@ func New() Model {
 
 	// Create session memory client for learning tracking
 	memoryClient := memory.NewClient()
+
+	// Create Guardian for destructive operation protection
+	guardianClient := guardian.New()
 
 	// Text input
 	ta := textarea.New()
@@ -186,6 +193,7 @@ func New() Model {
 		hermes:        hermesClient,
 		pensive:       pensiveBridge,
 		memory:        memoryClient,
+		guardian:      guardianClient,
 	}
 }
 
@@ -1165,6 +1173,25 @@ func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
 			m.updateChatView()
 			return m, nil
 		}
+
+		// Check Guardian for destructive operations in the consensus
+		// Scan all model messages since last user message for destructive patterns
+		destructiveContent := m.collectRecentModelContent(debate)
+		if m.guardian != nil && m.guardian.RequiresCanary(destructiveContent) {
+			// Look for canary in recent user messages
+			canary := m.findCanaryInRecentMessages(debate)
+			allowed, reason := m.guardian.ValidateExecution(destructiveContent, canary)
+
+			if !allowed {
+				patterns := m.guardian.DetectDestructive(destructiveContent)
+				debate.AddMessage("system", guardian.FormatWarning(patterns))
+				m.updateChatView()
+				return m, nil
+			}
+			// Log that canary was verified
+			debate.AddMessage("system", fmt.Sprintf("Guardian: %s", reason))
+		}
+
 		// Send execution request to Claude (the only executor)
 		debate.AddMessage("system", "Execution requested. Sending to Claude for implementation...")
 		m.updateChatView()
@@ -1348,6 +1375,56 @@ Summarize what you're about to do, then proceed with implementation. If you need
 
 		return nil
 	}
+}
+
+// collectRecentModelContent gathers all model messages since the last user message
+func (m *Model) collectRecentModelContent(debate *Debate) string {
+	if debate == nil {
+		return ""
+	}
+
+	var content strings.Builder
+
+	// Find last user message index
+	lastUserIdx := -1
+	for i := len(debate.Messages) - 1; i >= 0; i-- {
+		if debate.Messages[i].Source == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+
+	// Collect all model content after last user message
+	for i := lastUserIdx + 1; i < len(debate.Messages); i++ {
+		msg := debate.Messages[i]
+		if msg.Source != "system" && msg.Source != "user" {
+			content.WriteString(msg.Content)
+			content.WriteString("\n")
+		}
+	}
+
+	return content.String()
+}
+
+// findCanaryInRecentMessages looks for a canary in recent user messages
+func (m *Model) findCanaryInRecentMessages(debate *Debate) string {
+	if debate == nil {
+		return ""
+	}
+
+	// Check last 3 user messages for a canary
+	userMsgCount := 0
+	for i := len(debate.Messages) - 1; i >= 0 && userMsgCount < 3; i-- {
+		msg := debate.Messages[i]
+		if msg.Source == "user" {
+			if canary := guardian.ExtractCanary(msg.Content); canary != "" {
+				return canary
+			}
+			userMsgCount++
+		}
+	}
+
+	return ""
 }
 
 // logDebateLearnings extracts and logs learnings from a completed debate
