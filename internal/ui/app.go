@@ -14,10 +14,12 @@ import (
 	"github.com/google/uuid"
 
 	"roundtable/internal/config"
+	"roundtable/internal/consensus"
 	"roundtable/internal/db"
 	"roundtable/internal/hermes"
 	"roundtable/internal/models"
 	"roundtable/internal/orchestrator"
+	"roundtable/internal/pensive"
 )
 
 // Package-level program reference for async message sending
@@ -92,6 +94,9 @@ type Model struct {
 
 	// Hermes event client
 	hermes *hermes.Client
+
+	// Pensive memory bridge
+	pensive *pensive.Bridge
 }
 
 func New() Model {
@@ -124,6 +129,9 @@ func New() Model {
 
 	// Create Hermes client for event tracking
 	hermesClient := hermes.NewClient()
+
+	// Create Pensive memory bridge
+	pensiveBridge := pensive.NewBridge()
 
 	// Text input
 	ta := textarea.New()
@@ -165,6 +173,7 @@ func New() Model {
 		viewMode:      ViewNormal,
 		historyState:  NewHistoryState(),
 		hermes:        hermesClient,
+		pensive:       pensiveBridge,
 	}
 }
 
@@ -397,7 +406,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case allModelsDoneMsg:
 		debate := m.activeDebate()
 		if debate != nil {
-			systemMsg := "All models have responded. Any objections or additions?"
+			// Check for consensus among model responses
+			consensusResult := m.checkDebateConsensus(debate)
+
+			var systemMsg string
+			if consensusResult.HasConsensus {
+				systemMsg = fmt.Sprintf("CONSENSUS REACHED: %d models agree (no objections). Ready for execution.", consensusResult.AgreeCount)
+
+				// Build consensus description for storage
+				consensusText := fmt.Sprintf("Agreement target: %s", consensusResult.AgreementTarget)
+				if len(consensusResult.Additions) > 0 {
+					consensusText += fmt.Sprintf(" with %d additions", len(consensusResult.Additions))
+				}
+
+				// Emit Hermes consensus event
+				if m.hermes != nil {
+					m.hermes.ConsensusReached(debate.ID, consensusText)
+				}
+
+				// Update debate status in database
+				if m.store != nil {
+					m.store.UpdateDebateStatus(debate.ID, "resolved", consensusText)
+				}
+
+				// Store debate to Pensive for future reference
+				m.storeDebateToPensive(debate, consensusText)
+			} else {
+				systemMsg = "All models have responded. Any objections or additions?"
+				if consensusResult.ObjectCount > 0 {
+					systemMsg = fmt.Sprintf("All models have responded. %d objection(s) raised - consensus not reached.", consensusResult.ObjectCount)
+				}
+			}
+
 			debate.AddMessage("system", systemMsg)
 			m.saveMessage(debate.ID, "system", systemMsg, "system")
 			m.updateChatView()
@@ -824,4 +864,109 @@ func (m *Model) dispatchToModels(prompt string) tea.Cmd {
 
 		return nil
 	}
+}
+
+// checkDebateConsensus analyzes the most recent round of model responses
+// and returns consensus analysis results
+func (m *Model) checkDebateConsensus(debate *Debate) consensus.ConsensusResult {
+	if debate == nil || len(debate.Messages) == 0 {
+		return consensus.ConsensusResult{}
+	}
+
+	// Find the most recent user message and collect model responses after it
+	positions := make(map[string]consensus.ParsedPosition)
+
+	// Iterate backwards to find the last user message
+	lastUserIdx := -1
+	for i := len(debate.Messages) - 1; i >= 0; i-- {
+		if debate.Messages[i].Source == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+
+	if lastUserIdx == -1 {
+		return consensus.ConsensusResult{}
+	}
+
+	// Collect model responses after the last user message
+	for i := lastUserIdx + 1; i < len(debate.Messages); i++ {
+		msg := debate.Messages[i]
+		// Skip system messages and user messages
+		if msg.Source == "system" || msg.Source == "user" {
+			continue
+		}
+		// This is a model response
+		parsed := consensus.ParseResponse(msg.Content)
+		positions[msg.Source] = parsed
+	}
+
+	return consensus.AnalyzeConsensus(positions)
+}
+
+// EmitExecutionComplete emits a Hermes event when execution is complete.
+// This should be called after Claude (or other executor) completes a task.
+func (m *Model) EmitExecutionComplete(debateID string, success bool, result string) {
+	if m.hermes != nil {
+		m.hermes.ExecutionComplete(debateID, success, result)
+	}
+
+	// Also track execution outcome in Pensive for learning
+	if m.pensive != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m.pensive.UpdateExecutionOutcome(ctx, debateID, success, result)
+	}
+}
+
+// storeDebateToPensive stores a completed debate to Pensive memory
+func (m *Model) storeDebateToPensive(debate *Debate, consensusText string) {
+	if m.pensive == nil || m.store == nil || debate == nil {
+		return
+	}
+
+	// Get the debate from the store for full metadata
+	dbDebate, err := m.store.GetDebate(debate.ID)
+	if err != nil {
+		return
+	}
+
+	// Get all messages
+	messages, err := m.store.GetMessages(debate.ID)
+	if err != nil {
+		return
+	}
+
+	// Update consensus if provided
+	if consensusText != "" {
+		dbDebate.Consensus = consensusText
+	}
+
+	// Store asynchronously to not block the UI
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := m.pensive.StoreDebate(ctx, dbDebate, messages); err != nil {
+			// Silent failure - this is fire-and-forget
+			// The file fallback will catch it
+		}
+	}()
+}
+
+// queryPensiveContext queries Pensive for relevant past debates and formats them as context
+func (m *Model) queryPensiveContext(topic string) string {
+	if m.pensive == nil {
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	debates, err := m.pensive.QueryRelevantDebates(ctx, topic, 3)
+	if err != nil || len(debates) == 0 {
+		return ""
+	}
+
+	return m.pensive.FormatContextForDebate(debates)
 }
