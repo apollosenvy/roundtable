@@ -15,6 +15,7 @@ import (
 
 	"roundtable/internal/config"
 	"roundtable/internal/db"
+	"roundtable/internal/hermes"
 	"roundtable/internal/models"
 	"roundtable/internal/orchestrator"
 )
@@ -88,6 +89,9 @@ type Model struct {
 	// View mode state (normal, history browser, etc.)
 	viewMode     ViewMode
 	historyState *HistoryState
+
+	// Hermes event client
+	hermes *hermes.Client
 }
 
 func New() Model {
@@ -117,6 +121,9 @@ func New() Model {
 		retryDelay = time.Second
 	}
 	orch := orchestrator.NewWithRetry(registry, timeout, retryAttempts, retryDelay)
+
+	// Create Hermes client for event tracking
+	hermesClient := hermes.NewClient()
 
 	// Text input
 	ta := textarea.New()
@@ -157,6 +164,7 @@ func New() Model {
 		streamingMsgs: make(map[string]int),
 		viewMode:      ViewNormal,
 		historyState:  NewHistoryState(),
+		hermes:        hermesClient,
 	}
 }
 
@@ -439,6 +447,11 @@ func (m *Model) createTab() {
 	// Persist new debate to database
 	if m.store != nil {
 		m.store.CreateDebate(debateID, debateName, "")
+	}
+
+	// Emit Hermes event for debate started
+	if m.hermes != nil {
+		m.hermes.DebateStarted(debateID, debateName, m.registry.Count())
 	}
 
 	m.updateChatView()
