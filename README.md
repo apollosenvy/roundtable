@@ -307,6 +307,38 @@ grok:
 
 Roundtable connects to X.AI's API endpoint with streaming.
 
+## Security: Guardian Protection
+
+Roundtable integrates with AEGIS Guardian to prevent destructive operations from executing without explicit authorization.
+
+### How It Works
+
+When you use `/execute` after reaching consensus, Guardian scans the model responses for potentially destructive patterns:
+
+- File operations: `rm -rf`, `unlink`, delete operations
+- Git operations: `git push --force`, `git reset --hard`, `git branch -D`
+- Database operations: `DROP TABLE`, `TRUNCATE`, `DELETE FROM` without WHERE
+- Service operations: `systemctl stop`, `kill -9`, process termination
+- Credential changes: `chmod 777`, password modifications
+
+If destructive patterns are detected, execution is **blocked** until you provide a valid canary.
+
+### Providing Authorization
+
+To proceed with a destructive operation:
+
+1. View your current canary: `python3 ~/Projects/scripts/aegis-guardian/rotate-canary.py --show`
+2. Include the canary in your message: `"phosphor-7482: yes, proceed with the deletion"`
+3. Run `/execute` again
+
+The canary is a short-lived authorization token that proves you (the human) are actively authorizing the operation. This prevents scenarios where multiple AI models agree on something destructive and execute it without human oversight.
+
+### Why This Matters
+
+Other models (GPT, Grok, Gemini) can suggest destructive operations. They might all agree that "we should delete the old schema" or "push force to fix the history." Claude, as the executor, could technically comply.
+
+Guardian ensures: **Claude won't execute destructive operations just because other models agree.** Human authorization (via canary) is always required for dangerous actions.
+
 ## Integrations
 
 ### Hermes (Session Lifecycle)
@@ -330,16 +362,33 @@ python3 ~/Projects/scripts/hermes.py --server
 # Roundtable will auto-emit events to port 5965
 ```
 
-### Pensive Memory
+### Pensive Memory (Debate Storage)
 
-Debate insights are logged to session memory:
+Completed debates are stored to Pensive for semantic search:
+
+```bash
+# Debates are stored at ~/.local/share/pensive/roundtable/
+# Query past debates:
+python3 ~/Projects/AEGIS/pensive/pensive_cli.py query "API design decisions"
+```
+
+When starting a new debate, Roundtable automatically queries Pensive for relevant past debates and injects them as context. This means: if you debated REST vs GraphQL last month, and start a new API debate, the models will see what you decided before.
+
+### Session Memory (Learning from Debates)
+
+Debate outcomes are logged to session memory:
 
 ```bash
 # After a debate concludes, Roundtable logs:
-python3 ~/Projects/scripts/claude-session-memory.py log "roundtable" "..."
+# - Consensus outcomes (what was decided)
+# - Failed approaches (what was rejected and why)
+# - Cross-project insights (when debates mention multiple projects)
+
+# View learnings:
+python3 ~/Projects/scripts/claude-session-memory.py failures --project roundtable
 ```
 
-This feeds into future session briefings so Claude remembers debate patterns across sessions.
+This feeds into future session briefings so Claude remembers debate patterns across sessions. If a particular approach was rejected (e.g., "GraphQL adds too much complexity for this use case"), future debates will surface that context.
 
 ### Voice Control
 
