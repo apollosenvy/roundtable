@@ -1,0 +1,41 @@
+# Binary artifacts
+roundtable
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Distribution directory
+/dist/
+
+# Vendor directory (if using vendoring)
+/vendor/
+
+# Test artifacts
+*.test
+coverage.out
+*.coverprofile
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vim/
+
+# Go build cache
+/.cache/
+/tmp/
