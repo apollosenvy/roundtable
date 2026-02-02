@@ -28,17 +28,61 @@ type Debate struct {
 	Paused       bool
 
 	// Model states
-	ModelStatus map[string]models.ModelStatus
+	ModelStatus    map[string]models.ModelStatus
+	ModelStartTime map[string]time.Time // When each model started responding
+	AnimationFrame int                   // For streaming indicator animation
 }
 
 func NewDebate(id, name string) *Debate {
 	return &Debate{
-		ID:           id,
-		Name:         name,
-		Messages:     []DebateMessage{},
-		ContextFiles: make(map[string]string),
-		ModelStatus:  make(map[string]models.ModelStatus),
+		ID:             id,
+		Name:           name,
+		Messages:       []DebateMessage{},
+		ContextFiles:   make(map[string]string),
+		ModelStatus:    make(map[string]models.ModelStatus),
+		ModelStartTime: make(map[string]time.Time),
+		AnimationFrame: 0,
 	}
+}
+
+// UpdateModelStatus updates a model's status and tracks timing
+func (d *Debate) UpdateModelStatus(modelID string, status models.ModelStatus) {
+	oldStatus := d.ModelStatus[modelID]
+	d.ModelStatus[modelID] = status
+
+	// Track when model starts responding
+	if status == models.StatusResponding && oldStatus != models.StatusResponding {
+		d.ModelStartTime[modelID] = time.Now()
+	}
+
+	// Clear start time when model stops responding
+	if status != models.StatusResponding && oldStatus == models.StatusResponding {
+		delete(d.ModelStartTime, modelID)
+	}
+}
+
+// TickAnimation advances the streaming indicator animation
+func (d *Debate) TickAnimation() {
+	d.AnimationFrame = (d.AnimationFrame + 1) % 4
+}
+
+// streamingIndicator returns the current animation frame for streaming
+func (d *Debate) streamingIndicator() string {
+	frames := []string{"", ".", "..", "..."}
+	return frames[d.AnimationFrame]
+}
+
+// formatElapsedTime formats duration in a human-readable way
+func formatElapsedTime(elapsed time.Duration) string {
+	if elapsed < time.Second {
+		return "<1s"
+	}
+	if elapsed < time.Minute {
+		return fmt.Sprintf("%ds", int(elapsed.Seconds()))
+	}
+	mins := int(elapsed.Minutes())
+	secs := int(elapsed.Seconds()) % 60
+	return fmt.Sprintf("%dm%ds", mins, secs)
 }
 
 func (d *Debate) AddMessage(source, content string) {
@@ -106,11 +150,30 @@ func (d *Debate) RenderModelStatus(modelIDs []string, height int) string {
 		style := ModelStyle(id)
 
 		name := formatSource(id)
+
+		// Build status line with optional elapsed time
+		var statusLine string
 		if status == models.StatusResponding {
-			name += "..."
+			// Add animated streaming indicator
+			name += d.streamingIndicator()
+
+			// Add elapsed time if available
+			if startTime, ok := d.ModelStartTime[id]; ok {
+				elapsed := time.Since(startTime)
+				elapsedStr := formatElapsedTime(elapsed)
+				statusLine = fmt.Sprintf("%s %s %s",
+					indicator,
+					style.Render(name),
+					DimStyle.Render(fmt.Sprintf("(%s)", elapsedStr)))
+			} else {
+				statusLine = fmt.Sprintf("%s %s", indicator, style.Render(name))
+			}
+		} else {
+			statusLine = fmt.Sprintf("%s %s", indicator, style.Render(name))
 		}
 
-		sb.WriteString(fmt.Sprintf("%s %s\n", indicator, style.Render(name)))
+		sb.WriteString(statusLine)
+		sb.WriteString("\n")
 	}
 
 	return sb.String()
