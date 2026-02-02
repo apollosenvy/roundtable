@@ -258,3 +258,21 @@ func (s *Store) UpdateDebateStatus(id, status, consensus string) error {
 	)
 	return err
 }
+
+// UpdateDebateName updates the name of a debate
+func (s *Store) UpdateDebateName(id, name string) error {
+	_, err := s.db.Exec(
+		`UPDATE debates SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		name, id,
+	)
+	return err
+}
+
+// RemoveContextFile removes a context file from a debate
+func (s *Store) RemoveContextFile(debateID, path string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM context_files WHERE debate_id = ? AND path = ?`,
+		debateID, path,
+	)
+	return err
+}

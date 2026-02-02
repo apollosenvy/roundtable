@@ -13,10 +13,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
 
+	"roundtable/internal/commands"
 	"roundtable/internal/config"
 	"roundtable/internal/consensus"
+	ctxloader "roundtable/internal/context"
 	"roundtable/internal/db"
 	"roundtable/internal/hermes"
+	"roundtable/internal/memory"
 	"roundtable/internal/models"
 	"roundtable/internal/orchestrator"
 	"roundtable/internal/pensive"
@@ -97,6 +100,9 @@ type Model struct {
 
 	// Pensive memory bridge
 	pensive *pensive.Bridge
+
+	// Session memory client for learning tracking
+	memory *memory.Client
 }
 
 func New() Model {
@@ -132,6 +138,9 @@ func New() Model {
 
 	// Create Pensive memory bridge
 	pensiveBridge := pensive.NewBridge()
+
+	// Create session memory client for learning tracking
+	memoryClient := memory.NewClient()
 
 	// Text input
 	ta := textarea.New()
@@ -174,6 +183,7 @@ func New() Model {
 		historyState:  NewHistoryState(),
 		hermes:        hermesClient,
 		pensive:       pensiveBridge,
+		memory:        memoryClient,
 	}
 }
 
@@ -274,21 +284,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "ctrl+enter":
-			// Send message
-			prompt := strings.TrimSpace(m.input.Value())
-			if prompt != "" && m.activeDebate() != nil {
+			// Send message or execute command
+			input := strings.TrimSpace(m.input.Value())
+			if input == "" {
+				return m, nil
+			}
+
+			// Check if this is a slash command
+			if cmd := commands.Parse(input); cmd != nil {
+				m.input.Reset()
+				return m.handleCommand(cmd)
+			}
+
+			// Not a command - send as prompt to models
+			if m.activeDebate() != nil {
 				debate := m.activeDebate()
-				debate.AddMessage("user", prompt)
+				debate.AddMessage("user", input)
 
 				// Persist user message to database
-				m.saveMessage(debate.ID, "user", prompt, "user")
+				m.saveMessage(debate.ID, "user", input, "user")
 
 				m.input.Reset()
 				// Clear streaming state for new round
 				m.streamingMsgs = make(map[string]int)
 				m.updateChatView()
 				// Dispatch to all models in parallel
-				return m, m.dispatchToModels(prompt)
+				return m, m.dispatchToModels(input)
 			}
 			return m, nil
 
@@ -431,10 +452,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Store debate to Pensive for future reference
 				m.storeDebateToPensive(debate, consensusText)
+
+				// Log learnings to session memory for future Claude sessions
+				m.logDebateLearnings(debate)
 			} else {
 				systemMsg = "All models have responded. Any objections or additions?"
 				if consensusResult.ObjectCount > 0 {
 					systemMsg = fmt.Sprintf("All models have responded. %d objection(s) raised - consensus not reached.", consensusResult.ObjectCount)
+
+					// Log failed approaches even without full consensus
+					m.logDebateLearnings(debate)
 				}
 			}
 
@@ -1027,4 +1054,281 @@ func (m *Model) queryPensiveContext(topic string) string {
 	}
 
 	return m.pensive.FormatContextForDebate(debates)
+}
+
+// handleCommand processes a parsed slash command and returns the updated model
+func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
+	debate := m.activeDebate()
+
+	switch c := cmd.(type) {
+	case commands.Help:
+		m.showHelp = true
+		return m, nil
+
+	case commands.NewDebate:
+		name := c.Name
+		if name == "" {
+			name = fmt.Sprintf("Debate %d", len(m.debates)+1)
+		}
+		debateID := uuid.New().String()[:8]
+		newDebate := NewDebate(debateID, name)
+		m.debates = append(m.debates, newDebate)
+		m.activeTab = len(m.debates) - 1
+
+		if m.store != nil {
+			m.store.CreateDebate(debateID, name, "")
+		}
+		if m.hermes != nil {
+			m.hermes.DebateStarted(debateID, name, m.registry.Count())
+		}
+		m.updateChatView()
+		return m, nil
+
+	case commands.CloseDebate:
+		m.closeTab(m.activeTab)
+		return m, nil
+
+	case commands.RenameDebate:
+		if debate != nil && c.Name != "" {
+			debate.Name = c.Name
+			if m.store != nil {
+				m.store.UpdateDebateName(debate.ID, c.Name)
+			}
+		}
+		return m, nil
+
+	case commands.AddContext:
+		if debate == nil {
+			return m, nil
+		}
+		// Load the file/directory content
+		content, err := ctxloader.LoadContext(c.Path)
+		if err != nil {
+			debate.AddMessage("system", fmt.Sprintf("Failed to load context: %v", err))
+		} else {
+			debate.ContextFiles[c.Path] = content
+			m.saveContextFile(debate.ID, c.Path, content)
+			debate.AddMessage("system", fmt.Sprintf("Added context: %s", c.Path))
+		}
+		m.updateChatView()
+		return m, nil
+
+	case commands.RemoveContext:
+		if debate != nil {
+			delete(debate.ContextFiles, c.Path)
+			if m.store != nil {
+				m.store.RemoveContextFile(debate.ID, c.Path)
+			}
+			debate.AddMessage("system", fmt.Sprintf("Removed context: %s", c.Path))
+			m.updateChatView()
+		}
+		return m, nil
+
+	case commands.ListContext:
+		if debate != nil {
+			var files []string
+			for path := range debate.ContextFiles {
+				files = append(files, path)
+			}
+			if len(files) == 0 {
+				debate.AddMessage("system", "No context files loaded")
+			} else {
+				debate.AddMessage("system", "Context files:\n- "+strings.Join(files, "\n- "))
+			}
+			m.updateChatView()
+		}
+		return m, nil
+
+	case commands.ToggleModels:
+		m.focus = FocusModels
+		return m, nil
+
+	case commands.ForceConsensus:
+		if debate != nil {
+			// Dispatch consensus check to all models
+			m.streamingMsgs = make(map[string]int)
+			return m, m.dispatchConsensusCheck()
+		}
+		return m, nil
+
+	case commands.Execute:
+		if debate == nil {
+			return m, nil
+		}
+		// Check for consensus before allowing execution
+		consensusResult := m.checkDebateConsensus(debate)
+		if !consensusResult.HasConsensus {
+			debate.AddMessage("system", "Cannot execute: consensus not reached. Use /consensus to check positions.")
+			m.updateChatView()
+			return m, nil
+		}
+		// Send execution request to Claude (the only executor)
+		debate.AddMessage("system", "Execution requested. Sending to Claude for implementation...")
+		m.updateChatView()
+		return m, m.dispatchExecutionToClaude()
+
+	case commands.Pause:
+		if debate != nil {
+			debate.Paused = true
+			debate.AddMessage("system", "Debate paused. Use /resume to continue.")
+			m.updateChatView()
+		}
+		return m, nil
+
+	case commands.Resume:
+		if debate != nil {
+			debate.Paused = false
+			debate.AddMessage("system", "Debate resumed.")
+			m.updateChatView()
+		}
+		return m, nil
+
+	case commands.ShowHistory:
+		m.viewMode = ViewHistory
+		if m.historyState == nil {
+			m.historyState = NewHistoryState()
+		}
+		m.historyState.SetMaxHeight(m.height)
+		m.historyState.LoadDebates(m.store)
+		return m, nil
+
+	case commands.Export:
+		if debate != nil {
+			// Export is handled elsewhere - just notify
+			debate.AddMessage("system", "Export functionality: use /export to save debate to markdown (feature pending full implementation)")
+			m.updateChatView()
+		}
+		return m, nil
+
+	case commands.ParseError:
+		if debate != nil {
+			debate.AddMessage("system", fmt.Sprintf("Command error: %s\n\n%s", c.Message, commands.HelpText()))
+			m.updateChatView()
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// dispatchConsensusCheck sends the consensus prompt to all models
+func (m *Model) dispatchConsensusCheck() tea.Cmd {
+	return func() tea.Msg {
+		debate := m.activeDebate()
+		if debate == nil || m.orchestrator == nil {
+			return nil
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelDebate = cancel
+
+		// Convert debate messages to model messages format
+		var history []models.Message
+		for _, msg := range debate.Messages {
+			history = append(history, models.Message{
+				Source:    msg.Source,
+				Content:   msg.Content,
+				Timestamp: msg.Timestamp,
+			})
+		}
+
+		// Use orchestrator's consensus prompt
+		responses := m.orchestrator.ConsensusPrompt(ctx, history)
+
+		// Forward responses to the UI
+		go func() {
+			for resp := range responses {
+				if program != nil {
+					program.Send(modelResponseMsg{
+						modelID:   resp.ModelID,
+						content:   resp.Content,
+						done:      resp.Done,
+						err:       resp.Error,
+						isTimeout: resp.IsTimeout,
+					})
+				}
+			}
+			if program != nil {
+				program.Send(allModelsDoneMsg{})
+			}
+		}()
+
+		return nil
+	}
+}
+
+// dispatchExecutionToClaude sends the execution request to Claude only
+func (m *Model) dispatchExecutionToClaude() tea.Cmd {
+	return func() tea.Msg {
+		debate := m.activeDebate()
+		if debate == nil || m.orchestrator == nil {
+			return nil
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelDebate = cancel
+
+		// Build execution prompt with context from debate
+		executionPrompt := `Based on the consensus reached in this debate, please implement the agreed-upon approach.
+
+You have execution capabilities. The other models provided advisory input, but you are the executor.
+
+Summarize what you're about to do, then proceed with implementation. If you need user confirmation for destructive operations, ask first.`
+
+		// Convert debate messages to model messages format
+		var history []models.Message
+		for _, msg := range debate.Messages {
+			history = append(history, models.Message{
+				Source:    msg.Source,
+				Content:   msg.Content,
+				Timestamp: msg.Timestamp,
+			})
+		}
+
+		// Send only to Claude
+		responses := m.orchestrator.SendToModel(ctx, "claude", history, executionPrompt)
+
+		// Forward responses to the UI
+		go func() {
+			for resp := range responses {
+				if program != nil {
+					program.Send(modelResponseMsg{
+						modelID:   resp.ModelID,
+						content:   resp.Content,
+						done:      resp.Done,
+						err:       resp.Error,
+						isTimeout: resp.IsTimeout,
+					})
+				}
+			}
+			if program != nil {
+				program.Send(allModelsDoneMsg{})
+			}
+		}()
+
+		return nil
+	}
+}
+
+// logDebateLearnings extracts and logs learnings from a completed debate
+func (m *Model) logDebateLearnings(debate *Debate) {
+	if m.memory == nil || debate == nil {
+		return
+	}
+
+	// Convert debate messages to memory format
+	var memoryMessages []memory.DebateMessage
+	for _, msg := range debate.Messages {
+		memoryMessages = append(memoryMessages, memory.DebateMessage{
+			Source:    msg.Source,
+			Content:   msg.Content,
+			Timestamp: msg.Timestamp,
+		})
+	}
+
+	// Extract learnings asynchronously
+	go func() {
+		learnings := m.memory.ExtractLearnings(debate.ID, debate.Name, memoryMessages)
+		m.memory.LogLearnings(learnings)
+	}()
 }
