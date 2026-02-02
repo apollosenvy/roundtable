@@ -25,6 +25,7 @@ type Debate struct {
 	ID           string
 	Name         string
 	ProjectPath  string
+	CreatedAt    time.Time
 	Messages     []DebateMessage
 	ContextFiles map[string]string // path -> content
 	Paused       bool
@@ -39,6 +40,7 @@ func NewDebate(id, name string) *Debate {
 	return &Debate{
 		ID:             id,
 		Name:           name,
+		CreatedAt:      time.Now(),
 		Messages:       []DebateMessage{},
 		ContextFiles:   make(map[string]string),
 		ModelStatus:    make(map[string]models.ModelStatus),

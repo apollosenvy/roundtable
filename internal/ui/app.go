@@ -4,6 +4,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"roundtable/internal/consensus"
 	ctxloader "roundtable/internal/context"
 	"roundtable/internal/db"
+	"roundtable/internal/export"
 	"roundtable/internal/hermes"
 	"roundtable/internal/memory"
 	"roundtable/internal/models"
@@ -203,6 +205,7 @@ func loadDebatesFromStore(store *db.Store) []*Debate {
 
 		debate := NewDebate(dbDebate.ID, dbDebate.Name)
 		debate.ProjectPath = dbDebate.ProjectPath
+		debate.CreatedAt = dbDebate.CreatedAt
 
 		// Load messages for this debate
 		messages, err := store.GetMessages(dbDebate.ID)
@@ -1194,8 +1197,45 @@ func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
 
 	case commands.Export:
 		if debate != nil {
-			// Export is handled elsewhere - just notify
-			debate.AddMessage("system", "Export functionality: use /export to save debate to markdown (feature pending full implementation)")
+			// Build export data
+			debateExport := &export.DebateExport{
+				ID:          debate.ID,
+				Name:        debate.Name,
+				ProjectPath: debate.ProjectPath,
+				CreatedAt:   debate.CreatedAt,
+			}
+
+			// Convert messages
+			for _, msg := range debate.Messages {
+				debateExport.Messages = append(debateExport.Messages, export.DebateMessage{
+					Source:    msg.Source,
+					Content:   msg.Content,
+					Timestamp: msg.Timestamp,
+				})
+			}
+
+			// Collect context file paths
+			for path := range debate.ContextFiles {
+				debateExport.ContextFiles = append(debateExport.ContextFiles, path)
+			}
+
+			// Collect participants (unique model sources)
+			seen := make(map[string]bool)
+			for _, msg := range debate.Messages {
+				if msg.Source != "user" && msg.Source != "system" && !seen[msg.Source] {
+					debateExport.Participants = append(debateExport.Participants, msg.Source)
+					seen[msg.Source] = true
+				}
+			}
+
+			// Write to file in current directory
+			cwd, _ := os.Getwd()
+			path, err := export.WriteDebate(debateExport, cwd)
+			if err != nil {
+				debate.AddMessage("system", fmt.Sprintf("Export failed: %v", err))
+			} else {
+				debate.AddMessage("system", fmt.Sprintf("Debate exported to: %s", path))
+			}
 			m.updateChatView()
 		}
 		return m, nil
