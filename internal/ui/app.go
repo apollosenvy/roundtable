@@ -2,8 +2,10 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -14,7 +16,31 @@ import (
 	"roundtable/internal/config"
 	"roundtable/internal/db"
 	"roundtable/internal/models"
+	"roundtable/internal/orchestrator"
 )
+
+// Package-level program reference for async message sending
+var program *tea.Program
+
+// SetProgram sets the tea.Program reference for async operations
+func SetProgram(p *tea.Program) {
+	program = p
+}
+
+// Program returns the tea.Program reference
+func Program() *tea.Program {
+	return program
+}
+
+// Message types for async model responses
+type modelResponseMsg struct {
+	modelID string
+	content string
+	done    bool
+	err     error
+}
+
+type allModelsDoneMsg struct{}
 
 // Focus states
 type FocusPane int
@@ -49,6 +75,14 @@ type Model struct {
 
 	// Command state
 	showHelp bool
+
+	// Orchestrator
+	orchestrator *orchestrator.Orchestrator
+	cancelDebate context.CancelFunc
+
+	// Streaming state - tracks partial messages being built
+	// map[modelID]messageIndex - which message in debate.Messages is being streamed to
+	streamingMsgs map[string]int
 }
 
 func New() Model {
@@ -64,6 +98,13 @@ func New() Model {
 	// Create model registry
 	registry := models.NewRegistry(cfg)
 
+	// Create orchestrator with timeout from config
+	timeout := time.Duration(cfg.Defaults.ModelTimeout) * time.Second
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+	orch := orchestrator.New(registry, timeout)
+
 	// Text input
 	ta := textarea.New()
 	ta.Placeholder = "Enter your prompt... (Ctrl+Enter to send)"
@@ -73,18 +114,91 @@ func New() Model {
 	ta.ShowLineNumbers = false
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 
-	// Create initial debate
-	debateID := uuid.New().String()[:8]
-	firstDebate := NewDebate(debateID, "New Debate")
+	// Load existing debates from database or create initial debate
+	var debates []*Debate
+	if store != nil {
+		debates = loadDebatesFromStore(store)
+	}
+
+	// If no debates loaded, create a new one
+	if len(debates) == 0 {
+		debateID := uuid.New().String()[:8]
+		firstDebate := NewDebate(debateID, "New Debate")
+		debates = []*Debate{firstDebate}
+
+		// Persist the new debate to database
+		if store != nil {
+			store.CreateDebate(debateID, "New Debate", "")
+		}
+	}
 
 	return Model{
-		config:    cfg,
-		store:     store,
-		registry:  registry,
-		input:     ta,
-		debates:   []*Debate{firstDebate},
-		activeTab: 0,
-		focus:     FocusInput,
+		config:        cfg,
+		store:         store,
+		registry:      registry,
+		orchestrator:  orch,
+		input:         ta,
+		debates:       debates,
+		activeTab:     0,
+		focus:         FocusInput,
+		streamingMsgs: make(map[string]int),
+	}
+}
+
+// loadDebatesFromStore loads existing debates and their messages from the database
+func loadDebatesFromStore(store *db.Store) []*Debate {
+	dbDebates, err := store.ListDebates()
+	if err != nil {
+		return nil
+	}
+
+	var debates []*Debate
+	for _, dbDebate := range dbDebates {
+		// Only load active debates
+		if dbDebate.Status != "active" {
+			continue
+		}
+
+		debate := NewDebate(dbDebate.ID, dbDebate.Name)
+		debate.ProjectPath = dbDebate.ProjectPath
+
+		// Load messages for this debate
+		messages, err := store.GetMessages(dbDebate.ID)
+		if err == nil {
+			for _, msg := range messages {
+				debate.Messages = append(debate.Messages, DebateMessage{
+					Source:    msg.Source,
+					Content:   msg.Content,
+					Timestamp: msg.CreatedAt,
+				})
+			}
+		}
+
+		// Load context files for this debate
+		contextFiles, err := store.GetContextFiles(dbDebate.ID)
+		if err == nil {
+			for _, cf := range contextFiles {
+				debate.ContextFiles[cf.Path] = cf.Content
+			}
+		}
+
+		debates = append(debates, debate)
+	}
+
+	return debates
+}
+
+// saveMessage persists a message to the database
+func (m *Model) saveMessage(debateID, source, content, msgType string) {
+	if m.store != nil {
+		m.store.AddMessage(debateID, source, content, msgType)
+	}
+}
+
+// saveContextFile persists a context file to the database
+func (m *Model) saveContextFile(debateID, path, content string) {
+	if m.store != nil {
+		m.store.AddContextFile(debateID, path, content)
 	}
 }
 
@@ -466,45 +580,4 @@ func (m Model) renderInputPane() string {
 	)
 }
 
-func (m Model) renderHelp() string {
-	help := `
-ROUNDTABLE HELP
-
-NAVIGATION
-  Tab / Shift+Tab    Cycle focus between panes
-  Alt+1-9            Switch to tab N
-  Alt+[ / Alt+]      Previous / Next tab
-  Esc                Return to input
-
-ACTIONS
-  Ctrl+Enter         Send message to all models
-  Ctrl+Space         Pause / Resume auto-debate
-  Ctrl+E             Execute (after consensus)
-
-TABS
-  Alt+N              New debate
-  Alt+W              Close current tab
-
-COMMANDS
-  /help              Show this help
-  /new [name]        New debate
-  /close             Close debate
-  /context add PATH  Load file into context
-  /context list      List context files
-  /models            Toggle model picker
-  /consensus         Force consensus check
-  /execute           Execute agreed approach
-  /pause             Pause auto-debate
-  /resume            Resume auto-debate
-  /history           Browse past debates
-  /export            Export to markdown
-
-Press F1 or ? to toggle this help
-`
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
-		lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(Cyan).
-			Padding(1, 2).
-			Render(help))
-}
+// renderHelp is defined in help.go
