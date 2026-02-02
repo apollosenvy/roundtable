@@ -497,6 +497,38 @@ func (m *Model) createTab() {
 	m.updateChatView()
 }
 
+// createTabWithContext creates a new debate tab and queries Pensive for relevant context
+func (m *Model) createTabWithContext(topic string) {
+	debateID := uuid.New().String()[:8]
+	debateName := fmt.Sprintf("Debate %d", len(m.debates)+1)
+	debate := NewDebate(debateID, debateName)
+
+	// Query Pensive for relevant past debates
+	if pensiveContext := m.queryPensiveContext(topic); pensiveContext != "" {
+		// Add context as a system message at the start of the debate
+		debate.AddMessage("system", fmt.Sprintf("Relevant context from past debates:\n%s", pensiveContext))
+	}
+
+	m.debates = append(m.debates, debate)
+	m.activeTab = len(m.debates) - 1
+
+	// Persist new debate to database
+	if m.store != nil {
+		m.store.CreateDebate(debateID, debateName, "")
+		// Also persist the context message if any
+		if len(debate.Messages) > 0 {
+			m.store.AddMessage(debateID, "system", debate.Messages[0].Content, "system")
+		}
+	}
+
+	// Emit Hermes event for debate started
+	if m.hermes != nil {
+		m.hermes.DebateStarted(debateID, debateName, m.registry.Count())
+	}
+
+	m.updateChatView()
+}
+
 func (m *Model) closeTab(idx int) {
 	if idx < 0 || idx >= len(m.debates) || len(m.debates) <= 1 {
 		return
@@ -506,6 +538,12 @@ func (m *Model) closeTab(idx int) {
 	closedDebate := m.debates[idx]
 	if m.store != nil && closedDebate != nil {
 		m.store.UpdateDebateStatus(closedDebate.ID, "abandoned", "")
+
+		// Store abandoned debates to Pensive too - we can learn from incomplete discussions
+		// Only if there was meaningful discussion (more than just the initial prompt)
+		if len(closedDebate.Messages) > 2 {
+			m.storeDebateToPensive(closedDebate, "")
+		}
 	}
 
 	m.debates = append(m.debates[:idx], m.debates[idx+1:]...)
@@ -829,6 +867,26 @@ func (m *Model) dispatchToModels(prompt string) tea.Cmd {
 		// Create cancellable context
 		ctx, cancel := context.WithCancel(context.Background())
 		m.cancelDebate = cancel
+
+		// On first message in debate, query Pensive for relevant context
+		// Count non-system, non-user messages to determine if this is the first prompt
+		modelMsgCount := 0
+		for _, msg := range debate.Messages {
+			if msg.Source != "system" && msg.Source != "user" {
+				modelMsgCount++
+			}
+		}
+
+		// If this is the first prompt (no model responses yet), inject Pensive context
+		if modelMsgCount == 0 && m.pensive != nil {
+			if pensiveContext := m.queryPensiveContext(prompt); pensiveContext != "" {
+				// Add context as a system message before the models respond
+				contextMsg := fmt.Sprintf("Context from relevant past debates:\n%s", pensiveContext)
+				debate.AddMessage("system", contextMsg)
+				m.saveMessage(debate.ID, "system", contextMsg, "system")
+				m.updateChatView()
+			}
+		}
 
 		// Convert debate messages to model messages format
 		var history []models.Message
