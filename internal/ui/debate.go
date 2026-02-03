@@ -30,6 +30,11 @@ type Debate struct {
 	ContextFiles map[string]string // path -> content
 	Paused       bool
 
+	// Debate rounds tracking
+	DebateRound    int  // Current round (0 = initial, 1+ = discussion rounds)
+	MaxRounds      int  // Max auto-debate rounds before requiring user input (default 3)
+	AwaitingUser   bool // True if waiting for user input to continue
+
 	// Model states
 	ModelStatus    map[string]models.ModelStatus
 	ModelStartTime map[string]time.Time // When each model started responding
@@ -46,6 +51,9 @@ func NewDebate(id, name string) *Debate {
 		ModelStatus:    make(map[string]models.ModelStatus),
 		ModelStartTime: make(map[string]time.Time),
 		AnimationFrame: 0,
+		DebateRound:    0,
+		MaxRounds:      3,
+		AwaitingUser:   false,
 	}
 }
 

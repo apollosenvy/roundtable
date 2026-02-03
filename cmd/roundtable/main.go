@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -9,6 +11,9 @@ import (
 )
 
 func main() {
+	// Silence log output during TUI operation - it corrupts the display
+	log.SetOutput(io.Discard)
+
 	m := ui.New()
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 

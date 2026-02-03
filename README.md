@@ -153,9 +153,9 @@ ROUNDTABLE: New Debate                              3 models
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+Enter` | Send message to all enabled models |
-| `Ctrl+Space` | Pause/resume auto-debate |
-| `Alt+P` | Disable pause overlay (just type normally) |
+| `Enter` | Send message to all enabled models |
+| `Shift+Enter` | Insert newline (for multi-line input) |
+| `Alt+Enter` | Insert newline (alternative) |
 
 #### Navigation
 
@@ -173,7 +173,7 @@ ROUNDTABLE: New Debate                              3 models
 
 | Key | Action |
 |-----|--------|
-| `F1` or `?` | Show keybindings overlay |
+| `F1` | Show keybindings overlay |
 | `Alt+H` | Browse debate history |
 | `Esc` | Close overlays, return focus to input |
 | `Ctrl+C` or `Ctrl+Q` | Quit |

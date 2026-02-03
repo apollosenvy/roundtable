@@ -300,8 +300,7 @@ func (c *Client) sendHermesEvent(eventType string, data map[string]string) {
 
 	resp, err := c.httpClient.Post(HermesEndpoint, "application/json", bytes.NewReader(body))
 	if err != nil {
-		// Hermes might not be running, that's ok
-		log.Printf("[memory] hermes event delivery failed (daemon may not be running): %v", err)
+		// Hermes might not be running, that's ok - fail silently
 		return
 	}
 	defer resp.Body.Close()

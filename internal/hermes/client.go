@@ -31,9 +31,10 @@ type Event struct {
 
 // Client handles communication with the Hermes daemon
 type Client struct {
-	endpoint   string
-	httpClient *http.Client
-	enabled    bool
+	endpoint        string
+	httpClient      *http.Client
+	enabled         bool
+	connErrorLogged bool // Only log connection errors once
 }
 
 // NewClient creates a new Hermes client
@@ -87,8 +88,7 @@ func (c *Client) send(event Event) {
 	resp, err := c.httpClient.Post(c.endpoint, "application/json", bytes.NewReader(body))
 	if err != nil {
 		// Connection failures are expected when Hermes isn't running
-		// Just log at debug level and continue
-		log.Printf("[hermes] event delivery failed (hermes may not be running): %v", err)
+		// Silently ignore - no need to log
 		return
 	}
 	defer resp.Body.Close()

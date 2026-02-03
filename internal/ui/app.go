@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -39,6 +40,41 @@ func SetProgram(p *tea.Program) {
 // Program returns the tea.Program reference
 func Program() *tea.Program {
 	return program
+}
+
+// escapeSeqRegex matches terminal escape sequences that leak into input
+// This includes Kitty graphics protocol responses (_Gi=...) and other CSI sequences
+// Note: 0K can appear when \e[0K (ANSI clear-to-EOL) concatenates with _Gi=N;
+var escapeSeqRegex = regexp.MustCompile(`(?:\x1b|\\_G|\\_g)[^\x1b]*?(?:OK|0K|;|\x1b|$)|\\?_[Gg]i?=[^\\]*(?:OK|0K)?\\?|_[Gg]i?=\d*;?(?:OK|0K)?`)
+
+// stripEscapeSequences removes terminal escape sequences from input
+func stripEscapeSequences(s string) string {
+	// Remove Kitty graphics protocol responses and other escape sequences
+	s = escapeSeqRegex.ReplaceAllString(s, "")
+	// Handle all variations of Kitty graphics protocol responses
+	// Note: 0K variants occur when \e[0K (ANSI clear) concatenates with graphics responses
+	s = strings.ReplaceAll(s, `\_Gi=2;OK\`, "")
+	s = strings.ReplaceAll(s, `\_Gi=2;0K\`, "")
+	s = strings.ReplaceAll(s, `_Gi=2;OK`, "")
+	s = strings.ReplaceAll(s, `_Gi=2;0K`, "")
+	s = strings.ReplaceAll(s, `_Gi=1;OK`, "")
+	s = strings.ReplaceAll(s, `_Gi=1;0K`, "")
+	s = strings.ReplaceAll(s, `_Gi=1`, "")
+	s = strings.ReplaceAll(s, `_Gi=2`, "")
+	// Handle with leading > or other chars
+	s = strings.ReplaceAll(s, `> _Gi=1;OK`, "")
+	s = strings.ReplaceAll(s, `>_Gi=1;OK`, "")
+	// Clean up any remaining fragments
+	for strings.Contains(s, "_Gi=") {
+		start := strings.Index(s, "_Gi=")
+		end := start + 4
+		// Find the end of the escape sequence (;OK or just the number)
+		for end < len(s) && (s[end] >= '0' && s[end] <= '9' || s[end] == ';' || s[end] == 'O' || s[end] == 'K') {
+			end++
+		}
+		s = s[:start] + s[end:]
+	}
+	return strings.TrimSpace(s)
 }
 
 // Message types for async model responses
@@ -153,12 +189,14 @@ func New() Model {
 
 	// Text input
 	ta := textarea.New()
-	ta.Placeholder = "Enter your prompt... (Ctrl+Enter to send)"
+	ta.Placeholder = "Type here... (Enter to send)"
 	ta.Focus()
 	ta.CharLimit = 8192
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	// Disable textarea's built-in Enter handling - we handle it ourselves
+	ta.KeyMap.InsertNewline.SetEnabled(false)
 
 	// Load existing debates from database or create initial debate
 	var debates []*Debate
@@ -294,10 +332,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyState.LoadDebates(m.store)
 			return m, nil
 
-		case "ctrl+enter", "ctrl+s", "alt+enter":
+		case "shift+enter", "alt+enter":
+			// Insert newline into input (for multi-line messages)
+			m.input.InsertString("\n")
+			return m, nil
+
+		case "enter":
 			// Send message or execute command
-			// Note: ctrl+enter may not work in all terminals, ctrl+s and alt+enter are alternatives
-			input := strings.TrimSpace(m.input.Value())
+			input := stripEscapeSequences(m.input.Value())
 			if input == "" {
 				return m, nil
 			}
@@ -316,6 +358,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Persist user message to database
 				m.saveMessage(debate.ID, "user", input, "user")
 
+				// Reset debate state for new user input
+				debate.DebateRound = 0
+				debate.AwaitingUser = false
+
 				m.input.Reset()
 				// Clear streaming state for new round
 				m.streamingMsgs = make(map[string]int)
@@ -325,7 +371,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case "f1", "?":
+		case "f1":
 			m.showHelp = !m.showHelp
 			return m, nil
 
@@ -474,9 +520,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Check for consensus among model responses
 			consensusResult := m.checkDebateConsensus(debate)
 
-			var systemMsg string
 			if consensusResult.HasConsensus {
-				systemMsg = fmt.Sprintf("CONSENSUS REACHED: %d models agree (no objections). Ready for execution.", consensusResult.AgreeCount)
+				// Consensus reached - mark debate as resolved
+				systemMsg := fmt.Sprintf("CONSENSUS REACHED: %d models agree (no objections). Ready for execution.", consensusResult.AgreeCount)
 
 				// Build consensus description for storage
 				consensusText := fmt.Sprintf("Agreement target: %s", consensusResult.AgreementTarget)
@@ -499,19 +545,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Log learnings to session memory for future Claude sessions
 				m.logDebateLearnings(debate)
-			} else {
-				systemMsg = "All models have responded. Any objections or additions?"
-				if consensusResult.ObjectCount > 0 {
-					systemMsg = fmt.Sprintf("All models have responded. %d objection(s) raised - consensus not reached.", consensusResult.ObjectCount)
 
-					// Log failed approaches even without full consensus
-					m.logDebateLearnings(debate)
+				debate.AwaitingUser = true
+				debate.AddMessage("system", systemMsg)
+				m.saveMessage(debate.ID, "system", systemMsg, "system")
+				m.updateChatView()
+			} else if !debate.Paused && debate.DebateRound < debate.MaxRounds {
+				// No consensus yet, not paused, and under max rounds - trigger discussion
+				debate.DebateRound++
+
+				// Build discussion prompt
+				discussionPrompt := m.buildDiscussionPrompt(debate)
+				if discussionPrompt != "" {
+					// Add system message indicating new discussion round
+					roundMsg := fmt.Sprintf("=== Discussion Round %d of %d ===", debate.DebateRound, debate.MaxRounds)
+					if consensusResult.ObjectCount > 0 {
+						roundMsg += fmt.Sprintf(" (%d objection(s) raised)", consensusResult.ObjectCount)
+					}
+					debate.AddMessage("system", roundMsg)
+					m.saveMessage(debate.ID, "system", roundMsg, "system")
+					m.updateChatView()
+
+					// Dispatch to models for discussion
+					return m, m.dispatchToModels(discussionPrompt)
 				}
-			}
+			} else {
+				// Max rounds reached or paused - await user input
+				debate.AwaitingUser = true
 
-			debate.AddMessage("system", systemMsg)
-			m.saveMessage(debate.ID, "system", systemMsg, "system")
-			m.updateChatView()
+				var systemMsg string
+				if debate.Paused {
+					systemMsg = "Debate paused. Use /resume to continue auto-discussion or send a message to guide the conversation."
+				} else if debate.DebateRound >= debate.MaxRounds {
+					systemMsg = fmt.Sprintf("Reached maximum %d discussion rounds without full consensus. Please guide the discussion or use /consensus to force a final check.", debate.MaxRounds)
+					if consensusResult.ObjectCount > 0 {
+						systemMsg = fmt.Sprintf("Reached maximum %d discussion rounds. %d objection(s) still outstanding. Please guide the discussion.", debate.MaxRounds, consensusResult.ObjectCount)
+					}
+				} else {
+					systemMsg = "All models have responded. Any objections or additions?"
+					if consensusResult.ObjectCount > 0 {
+						systemMsg = fmt.Sprintf("All models have responded. %d objection(s) raised - consensus not reached.", consensusResult.ObjectCount)
+					}
+				}
+
+				// Log failed approaches even without full consensus
+				m.logDebateLearnings(debate)
+
+				debate.AddMessage("system", systemMsg)
+				m.saveMessage(debate.ID, "system", systemMsg, "system")
+				m.updateChatView()
+			}
 		}
 		return m, nil
 	}
@@ -832,7 +915,7 @@ func (m Model) renderStatusBar() string {
 	tabInfo := DimStyle.Render(fmt.Sprintf("[%d/%d]", m.activeTab+1, len(m.debates)))
 
 	// Keybinds
-	keys := DimStyle.Render("Ctrl+Enter:send | Alt+N:new | F1:help")
+	keys := DimStyle.Render("Enter:send | Shift+Enter:newline | F1:help")
 
 	left := lipgloss.JoinHorizontal(lipgloss.Left, " ", status, "  ", tabInfo)
 	right := keys + " "
@@ -959,6 +1042,22 @@ func (m *Model) dispatchToModels(prompt string) tea.Cmd {
 			}
 		}
 
+		// Build the full prompt including context files
+		fullPrompt := prompt
+		if len(debate.ContextFiles) > 0 {
+			var contextBuilder strings.Builder
+			contextBuilder.WriteString("=== CONTEXT FILES ===\n\n")
+			for path, content := range debate.ContextFiles {
+				contextBuilder.WriteString(fmt.Sprintf("--- %s ---\n", path))
+				contextBuilder.WriteString(content)
+				contextBuilder.WriteString("\n\n")
+			}
+			contextBuilder.WriteString("=== END CONTEXT ===\n\n")
+			contextBuilder.WriteString("User question:\n")
+			contextBuilder.WriteString(prompt)
+			fullPrompt = contextBuilder.String()
+		}
+
 		// Convert debate messages to model messages format
 		var history []models.Message
 		for _, msg := range debate.Messages {
@@ -970,7 +1069,7 @@ func (m *Model) dispatchToModels(prompt string) tea.Cmd {
 		}
 
 		// Start parallel model requests
-		responses := m.orchestrator.ParallelSeed(ctx, history, prompt)
+		responses := m.orchestrator.ParallelSeed(ctx, history, fullPrompt)
 
 		// Forward responses to the UI as tea messages
 		go func() {
@@ -993,6 +1092,80 @@ func (m *Model) dispatchToModels(prompt string) tea.Cmd {
 
 		return nil
 	}
+}
+
+// buildDiscussionPrompt creates a prompt for the discussion round
+// that asks models to critique each other's responses using AGREE/OBJECT/ADD format
+func (m *Model) buildDiscussionPrompt(debate *Debate) string {
+	if debate == nil || len(debate.Messages) == 0 {
+		return ""
+	}
+
+	// Find the original user question
+	var userQuestion string
+	for _, msg := range debate.Messages {
+		if msg.Source == "user" {
+			userQuestion = msg.Content
+			break
+		}
+	}
+
+	// Collect the most recent model responses (since last user message or system prompt for discussion)
+	var modelResponses []struct {
+		source  string
+		content string
+	}
+
+	// Find where the current round of responses started
+	startIdx := 0
+	for i := len(debate.Messages) - 1; i >= 0; i-- {
+		msg := debate.Messages[i]
+		if msg.Source == "user" || (msg.Source == "system" && (strings.Contains(msg.Content, "Discussion Round") || strings.Contains(msg.Content, "review each other"))) {
+			startIdx = i + 1
+			break
+		}
+	}
+
+	for i := startIdx; i < len(debate.Messages); i++ {
+		msg := debate.Messages[i]
+		if msg.Source != "system" && msg.Source != "user" && !msg.IsError {
+			// Truncate very long responses to keep discussion prompts manageable
+			content := msg.Content
+			const maxResponseLen = 2000
+			if len(content) > maxResponseLen {
+				content = content[:maxResponseLen] + "\n... [response truncated for brevity]"
+			}
+			modelResponses = append(modelResponses, struct {
+				source  string
+				content string
+			}{source: msg.Source, content: content})
+		}
+	}
+
+	if len(modelResponses) == 0 {
+		return ""
+	}
+
+	// Build the discussion prompt
+	var prompt strings.Builder
+	prompt.WriteString(fmt.Sprintf("=== Discussion Round %d ===\n\n", debate.DebateRound+1))
+	prompt.WriteString("Original question: ")
+	prompt.WriteString(userQuestion)
+	prompt.WriteString("\n\n")
+	prompt.WriteString("Previous responses from the roundtable:\n\n")
+
+	for _, resp := range modelResponses {
+		prompt.WriteString(fmt.Sprintf("**%s said:**\n%s\n\n", formatSource(resp.source), resp.content))
+	}
+
+	prompt.WriteString("---\n\n")
+	prompt.WriteString("Review the other models' responses and state your position. You MUST start your response with one of:\n\n")
+	prompt.WriteString("- **AGREE**: If you fully support another model's approach, explain why and what you like about it.\n")
+	prompt.WriteString("- **OBJECT**: If you have concerns or disagree with an approach, explain your reasoning and propose an alternative.\n")
+	prompt.WriteString("- **ADD**: If you generally agree but want to enhance or supplement the approach with additional considerations.\n\n")
+	prompt.WriteString("Be specific about which model(s) you're responding to. If the group is converging on a consensus, acknowledge it.\n")
+
+	return prompt.String()
 }
 
 // checkDebateConsensus analyzes the most recent round of model responses
@@ -1241,7 +1414,24 @@ func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
 	case commands.Resume:
 		if debate != nil {
 			debate.Paused = false
-			debate.AddMessage("system", "Debate resumed.")
+			debate.AwaitingUser = false
+
+			// Check if we should continue discussion
+			consensusResult := m.checkDebateConsensus(debate)
+			if !consensusResult.HasConsensus && debate.DebateRound < debate.MaxRounds {
+				// Build discussion prompt to continue
+				discussionPrompt := m.buildDiscussionPrompt(debate)
+				if discussionPrompt != "" {
+					debate.DebateRound++
+					roundMsg := fmt.Sprintf("Debate resumed. Starting discussion round %d of %d.", debate.DebateRound, debate.MaxRounds)
+					debate.AddMessage("system", roundMsg)
+					m.saveMessage(debate.ID, "system", roundMsg, "system")
+					m.updateChatView()
+					return m, m.dispatchToModels(discussionPrompt)
+				}
+			}
+
+			debate.AddMessage("system", "Debate resumed. Auto-discussion will continue after the next model responses.")
 			m.updateChatView()
 		}
 		return m, nil
