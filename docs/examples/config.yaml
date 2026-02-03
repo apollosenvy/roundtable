@@ -14,7 +14,7 @@ models:
   gpt:
     enabled: false             # Enable if you have an OpenAI API key
     api_key: ${OPENAI_API_KEY} # Uses environment variable
-    default_model: gpt-4o
+    default_model: gpt-5.2
 
   grok:
     enabled: false             # Enable if you have a Grok API key
