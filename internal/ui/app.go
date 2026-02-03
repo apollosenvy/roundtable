@@ -21,12 +21,8 @@ import (
 	ctxloader "roundtable/internal/context"
 	"roundtable/internal/db"
 	"roundtable/internal/export"
-	"roundtable/internal/guardian"
-	"roundtable/internal/hermes"
-	"roundtable/internal/memory"
 	"roundtable/internal/models"
 	"roundtable/internal/orchestrator"
-	"roundtable/internal/pensive"
 )
 
 // Package-level program reference for async message sending
@@ -133,18 +129,6 @@ type Model struct {
 	// View mode state (normal, history browser, etc.)
 	viewMode     ViewMode
 	historyState *HistoryState
-
-	// Hermes event client
-	hermes *hermes.Client
-
-	// Pensive memory bridge
-	pensive *pensive.Bridge
-
-	// Session memory client for learning tracking
-	memory *memory.Client
-
-	// Guardian for destructive operation protection
-	guardian *guardian.Guardian
 }
 
 func New() Model {
@@ -174,18 +158,6 @@ func New() Model {
 		retryDelay = time.Second
 	}
 	orch := orchestrator.NewWithRetry(registry, timeout, retryAttempts, retryDelay)
-
-	// Create Hermes client for event tracking
-	hermesClient := hermes.NewClient()
-
-	// Create Pensive memory bridge
-	pensiveBridge := pensive.NewBridge()
-
-	// Create session memory client for learning tracking
-	memoryClient := memory.NewClient()
-
-	// Create Guardian for destructive operation protection
-	guardianClient := guardian.New()
 
 	// Text input
 	ta := textarea.New()
@@ -228,10 +200,6 @@ func New() Model {
 		streamingMsgs: make(map[string]int),
 		viewMode:      ViewNormal,
 		historyState:  NewHistoryState(),
-		hermes:        hermesClient,
-		pensive:       pensiveBridge,
-		memory:        memoryClient,
-		guardian:      guardianClient,
 	}
 }
 
@@ -530,21 +498,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					consensusText += fmt.Sprintf(" with %d additions", len(consensusResult.Additions))
 				}
 
-				// Emit Hermes consensus event
-				if m.hermes != nil {
-					m.hermes.ConsensusReached(debate.ID, consensusText)
-				}
-
 				// Update debate status in database
 				if m.store != nil {
 					m.store.UpdateDebateStatus(debate.ID, "resolved", consensusText)
 				}
-
-				// Store debate to Pensive for future reference
-				m.storeDebateToPensive(debate, consensusText)
-
-				// Log learnings to session memory for future Claude sessions
-				m.logDebateLearnings(debate)
 
 				debate.AwaitingUser = true
 				debate.AddMessage("system", systemMsg)
@@ -587,9 +544,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						systemMsg = fmt.Sprintf("All models have responded. %d objection(s) raised - consensus not reached.", consensusResult.ObjectCount)
 					}
 				}
-
-				// Log failed approaches even without full consensus
-				m.logDebateLearnings(debate)
 
 				debate.AddMessage("system", systemMsg)
 				m.saveMessage(debate.ID, "system", systemMsg, "system")
@@ -643,43 +597,6 @@ func (m *Model) createTab() {
 		m.store.CreateDebate(debateID, debateName, "")
 	}
 
-	// Emit Hermes event for debate started
-	if m.hermes != nil {
-		m.hermes.DebateStarted(debateID, debateName, m.registry.Count())
-	}
-
-	m.updateChatView()
-}
-
-// createTabWithContext creates a new debate tab and queries Pensive for relevant context
-func (m *Model) createTabWithContext(topic string) {
-	debateID := uuid.New().String()[:8]
-	debateName := fmt.Sprintf("Debate %d", len(m.debates)+1)
-	debate := NewDebate(debateID, debateName)
-
-	// Query Pensive for relevant past debates
-	if pensiveContext := m.queryPensiveContext(topic); pensiveContext != "" {
-		// Add context as a system message at the start of the debate
-		debate.AddMessage("system", fmt.Sprintf("Relevant context from past debates:\n%s", pensiveContext))
-	}
-
-	m.debates = append(m.debates, debate)
-	m.activeTab = len(m.debates) - 1
-
-	// Persist new debate to database
-	if m.store != nil {
-		m.store.CreateDebate(debateID, debateName, "")
-		// Also persist the context message if any
-		if len(debate.Messages) > 0 {
-			m.store.AddMessage(debateID, "system", debate.Messages[0].Content, "system")
-		}
-	}
-
-	// Emit Hermes event for debate started
-	if m.hermes != nil {
-		m.hermes.DebateStarted(debateID, debateName, m.registry.Count())
-	}
-
 	m.updateChatView()
 }
 
@@ -692,12 +609,6 @@ func (m *Model) closeTab(idx int) {
 	closedDebate := m.debates[idx]
 	if m.store != nil && closedDebate != nil {
 		m.store.UpdateDebateStatus(closedDebate.ID, "abandoned", "")
-
-		// Store abandoned debates to Pensive too - we can learn from incomplete discussions
-		// Only if there was meaningful discussion (more than just the initial prompt)
-		if len(closedDebate.Messages) > 2 {
-			m.storeDebateToPensive(closedDebate, "")
-		}
 	}
 
 	m.debates = append(m.debates[:idx], m.debates[idx+1:]...)
@@ -1022,26 +933,6 @@ func (m *Model) dispatchToModels(prompt string) tea.Cmd {
 		ctx, cancel := context.WithCancel(context.Background())
 		m.cancelDebate = cancel
 
-		// On first message in debate, query Pensive for relevant context
-		// Count non-system, non-user messages to determine if this is the first prompt
-		modelMsgCount := 0
-		for _, msg := range debate.Messages {
-			if msg.Source != "system" && msg.Source != "user" {
-				modelMsgCount++
-			}
-		}
-
-		// If this is the first prompt (no model responses yet), inject Pensive context
-		if modelMsgCount == 0 && m.pensive != nil {
-			if pensiveContext := m.queryPensiveContext(prompt); pensiveContext != "" {
-				// Add context as a system message before the models respond
-				contextMsg := fmt.Sprintf("Context from relevant past debates:\n%s", pensiveContext)
-				debate.AddMessage("system", contextMsg)
-				m.saveMessage(debate.ID, "system", contextMsg, "system")
-				m.updateChatView()
-			}
-		}
-
 		// Build the full prompt including context files
 		fullPrompt := prompt
 		if len(debate.ContextFiles) > 0 {
@@ -1206,73 +1097,6 @@ func (m *Model) checkDebateConsensus(debate *Debate) consensus.ConsensusResult {
 	return consensus.AnalyzeConsensus(positions)
 }
 
-// EmitExecutionComplete emits a Hermes event when execution is complete.
-// This should be called after Claude (or other executor) completes a task.
-func (m *Model) EmitExecutionComplete(debateID string, success bool, result string) {
-	if m.hermes != nil {
-		m.hermes.ExecutionComplete(debateID, success, result)
-	}
-
-	// Also track execution outcome in Pensive for learning
-	if m.pensive != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		m.pensive.UpdateExecutionOutcome(ctx, debateID, success, result)
-	}
-}
-
-// storeDebateToPensive stores a completed debate to Pensive memory
-func (m *Model) storeDebateToPensive(debate *Debate, consensusText string) {
-	if m.pensive == nil || m.store == nil || debate == nil {
-		return
-	}
-
-	// Get the debate from the store for full metadata
-	dbDebate, err := m.store.GetDebate(debate.ID)
-	if err != nil {
-		return
-	}
-
-	// Get all messages
-	messages, err := m.store.GetMessages(debate.ID)
-	if err != nil {
-		return
-	}
-
-	// Update consensus if provided
-	if consensusText != "" {
-		dbDebate.Consensus = consensusText
-	}
-
-	// Store asynchronously to not block the UI
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := m.pensive.StoreDebate(ctx, dbDebate, messages); err != nil {
-			// Silent failure - this is fire-and-forget
-			// The file fallback will catch it
-		}
-	}()
-}
-
-// queryPensiveContext queries Pensive for relevant past debates and formats them as context
-func (m *Model) queryPensiveContext(topic string) string {
-	if m.pensive == nil {
-		return ""
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	debates, err := m.pensive.QueryRelevantDebates(ctx, topic, 3)
-	if err != nil || len(debates) == 0 {
-		return ""
-	}
-
-	return m.pensive.FormatContextForDebate(debates)
-}
-
 // handleCommand processes a parsed slash command and returns the updated model
 func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
 	debate := m.activeDebate()
@@ -1294,9 +1118,6 @@ func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
 
 		if m.store != nil {
 			m.store.CreateDebate(debateID, name, "")
-		}
-		if m.hermes != nil {
-			m.hermes.DebateStarted(debateID, name, m.registry.Count())
 		}
 		m.updateChatView()
 		return m, nil
@@ -1378,24 +1199,6 @@ func (m Model) handleCommand(cmd commands.Command) (tea.Model, tea.Cmd) {
 			debate.AddMessage("system", "Cannot execute: consensus not reached. Use /consensus to check positions.")
 			m.updateChatView()
 			return m, nil
-		}
-
-		// Check Guardian for destructive operations in the consensus
-		// Scan all model messages since last user message for destructive patterns
-		destructiveContent := m.collectRecentModelContent(debate)
-		if m.guardian != nil && m.guardian.RequiresCanary(destructiveContent) {
-			// Look for canary in recent user messages
-			canary := m.findCanaryInRecentMessages(debate)
-			allowed, reason := m.guardian.ValidateExecution(destructiveContent, canary)
-
-			if !allowed {
-				patterns := m.guardian.DetectDestructive(destructiveContent)
-				debate.AddMessage("system", guardian.FormatWarning(patterns))
-				m.updateChatView()
-				return m, nil
-			}
-			// Log that canary was verified
-			debate.AddMessage("system", fmt.Sprintf("Guardian: %s", reason))
 		}
 
 		// Send execution request to Claude (the only executor)
@@ -1600,75 +1403,3 @@ Summarize what you're about to do, then proceed with implementation. If you need
 	}
 }
 
-// collectRecentModelContent gathers all model messages since the last user message
-func (m *Model) collectRecentModelContent(debate *Debate) string {
-	if debate == nil {
-		return ""
-	}
-
-	var content strings.Builder
-
-	// Find last user message index
-	lastUserIdx := -1
-	for i := len(debate.Messages) - 1; i >= 0; i-- {
-		if debate.Messages[i].Source == "user" {
-			lastUserIdx = i
-			break
-		}
-	}
-
-	// Collect all model content after last user message
-	for i := lastUserIdx + 1; i < len(debate.Messages); i++ {
-		msg := debate.Messages[i]
-		if msg.Source != "system" && msg.Source != "user" {
-			content.WriteString(msg.Content)
-			content.WriteString("\n")
-		}
-	}
-
-	return content.String()
-}
-
-// findCanaryInRecentMessages looks for a canary in recent user messages
-func (m *Model) findCanaryInRecentMessages(debate *Debate) string {
-	if debate == nil {
-		return ""
-	}
-
-	// Check last 3 user messages for a canary
-	userMsgCount := 0
-	for i := len(debate.Messages) - 1; i >= 0 && userMsgCount < 3; i-- {
-		msg := debate.Messages[i]
-		if msg.Source == "user" {
-			if canary := guardian.ExtractCanary(msg.Content); canary != "" {
-				return canary
-			}
-			userMsgCount++
-		}
-	}
-
-	return ""
-}
-
-// logDebateLearnings extracts and logs learnings from a completed debate
-func (m *Model) logDebateLearnings(debate *Debate) {
-	if m.memory == nil || debate == nil {
-		return
-	}
-
-	// Convert debate messages to memory format
-	var memoryMessages []memory.DebateMessage
-	for _, msg := range debate.Messages {
-		memoryMessages = append(memoryMessages, memory.DebateMessage{
-			Source:    msg.Source,
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-		})
-	}
-
-	// Extract learnings asynchronously
-	go func() {
-		learnings := m.memory.ExtractLearnings(debate.ID, debate.Name, memoryMessages)
-		m.memory.LogLearnings(learnings)
-	}()
-}
