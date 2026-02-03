@@ -10,6 +10,6 @@ pkgbase = roundtable
 	optdepends = claude-code: Claude CLI for primary model
 	optdepends = gemini-cli: Gemini CLI support
 	source = roundtable-0.1.0.tar.gz::https://github.com/apollosenvy/roundtable/archive/v0.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = 512a2bf15919a207ddce10edcd6f9a3d9761ae04663f53d909bdf566960843ad
 
 pkgname = roundtable

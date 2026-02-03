@@ -13,7 +13,7 @@ optdepends=(
     'gemini-cli: Gemini CLI support'
 )
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/apollosenvy/roundtable/archive/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('512a2bf15919a207ddce10edcd6f9a3d9761ae04663f53d909bdf566960843ad')
 
 build() {
     cd "${pkgname}-${pkgver}"
