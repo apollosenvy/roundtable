@@ -75,7 +75,7 @@ models:
   gpt:
     enabled: true
     api_key: ${OPENAI_API_KEY}  # Expands from env var
-    default_model: gpt-5.2
+    default_model: gpt-4o
 
   grok:
     enabled: true
@@ -283,7 +283,7 @@ Then enable GPT in config:
 gpt:
   enabled: true
   api_key: ${OPENAI_API_KEY}
-  default_model: gpt-5.2
+  default_model: gpt-4o
 ```
 
 Roundtable connects directly to `https://api.openai.com/v1/chat/completions` with streaming.
