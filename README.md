@@ -35,7 +35,7 @@ This is especially valuable for:
 ### From Release
 
 ```bash
-wget https://github.com/example/roundtable/releases/download/v0.1.0/roundtable-linux-amd64
+wget https://github.com/apollosenvy/roundtable/releases/download/v0.1.0/roundtable-linux-amd64
 chmod +x roundtable-linux-amd64
 sudo mv roundtable-linux-amd64 /usr/local/bin/roundtable
 ```
@@ -43,7 +43,7 @@ sudo mv roundtable-linux-amd64 /usr/local/bin/roundtable
 ### From Source
 
 ```bash
-git clone https://github.com/example/roundtable.git
+git clone https://github.com/apollosenvy/roundtable.git
 cd roundtable
 go build -o roundtable ./cmd/roundtable
 sudo mv roundtable /usr/local/bin/

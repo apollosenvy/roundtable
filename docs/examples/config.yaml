@@ -1,0 +1,29 @@
+# Roundtable configuration
+# Copy to ~/.config/roundtable/config.yaml
+
+models:
+  claude:
+    enabled: true
+    cli_path: claude           # Path to Claude CLI (or just 'claude' if in PATH)
+    default_model: opus        # opus, sonnet, haiku
+
+  gemini:
+    enabled: true
+    cli_path: gemini           # Path to Gemini CLI
+
+  gpt:
+    enabled: false             # Enable if you have an OpenAI API key
+    api_key: ${OPENAI_API_KEY} # Uses environment variable
+    default_model: gpt-4o
+
+  grok:
+    enabled: false             # Enable if you have a Grok API key
+    api_key: ${GROK_API_KEY}
+    default_model: grok-2
+
+defaults:
+  auto_debate: true            # Automatically prompt "any objections?" after responses
+  consensus_timeout: 30        # Seconds to wait before checking consensus
+  model_timeout: 60            # Timeout per individual model response
+  retry_attempts: 3            # Retry failed API requests
+  retry_delay: 1000            # Milliseconds between retries
